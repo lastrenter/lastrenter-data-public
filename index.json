@@ -1,0 +1,281 @@
+{
+ "source": "https://data.gov.au/data/dataset/defence-airfields-australian-noise-exposure-forecast-anef",
+ "licence": "CC BY 3.0 AU",
+ "attribution": "Department of Defence",
+ "generated": "2026-08-11",
+ "bases": [
+  {
+   "base": "HMAS Albatross",
+   "file": "hmas-albatross.geojson",
+   "bbox": [
+    150.50287,
+    -34.97414,
+    150.57922,
+    -34.90733
+   ],
+   "bands": [
+    "20-25",
+    "25-30",
+    "30-35",
+    "30-35",
+    "35+",
+    "35+"
+   ]
+  },
+  {
+   "base": "Oakey Army Aviation Centre",
+   "file": "oakey-army-aviation-centre.geojson",
+   "bbox": [
+    151.68851,
+    -27.43891,
+    151.77595,
+    -27.37088
+   ],
+   "bands": [
+    "20-25",
+    "25-30",
+    "30+"
+   ]
+  },
+  {
+   "base": "RAAF Base Amberley",
+   "file": "raaf-base-amberley.geojson",
+   "bbox": [
+    152.6276,
+    -27.78566,
+    152.77509,
+    -27.48347
+   ],
+   "bands": [
+    "15-20",
+    "20-25",
+    "25-30",
+    "30-35",
+    "30-35",
+    "35-40",
+    "40+"
+   ]
+  },
+  {
+   "base": "RAAF Base Darwin",
+   "file": "raaf-base-darwin.geojson",
+   "bbox": [
+    130.76672,
+    -12.46522,
+    131.03449,
+    -12.36832
+   ],
+   "bands": [
+    "20-25",
+    "20-25",
+    "20-25",
+    "25-30",
+    "25-30",
+    "25-30",
+    "30-35",
+    "30-35",
+    "35-40",
+    "35-40",
+    "40+",
+    "40+"
+   ]
+  },
+  {
+   "base": "RAAF Base East Sale",
+   "file": "raaf-base-east-sale.geojson",
+   "bbox": [
+    147.08358,
+    -38.12463,
+    147.20227,
+    -38.06243
+   ],
+   "bands": [
+    "15-20",
+    "20-25",
+    "25-30",
+    "30-35",
+    "35-40",
+    "35-40",
+    "40+",
+    "40+",
+    "40+",
+    "40+",
+    "40+",
+    "40+",
+    "40+",
+    "40+",
+    "40+"
+   ]
+  },
+  {
+   "base": "RAAF Base Edinburgh",
+   "file": "raaf-base-edinburgh.geojson",
+   "bbox": [
+    138.56429,
+    -34.76006,
+    138.63776,
+    -34.65018
+   ],
+   "bands": [
+    "20-25",
+    "25-30",
+    "30-35",
+    "35-40",
+    "40+"
+   ]
+  },
+  {
+   "base": "RAAF Base Gingin",
+   "file": "raaf-base-gingin.geojson",
+   "bbox": [
+    115.83129,
+    -31.47966,
+    115.89746,
+    -31.4484
+   ],
+   "bands": [
+    "20-25",
+    "25-30",
+    "30-35",
+    "35-40",
+    "40+"
+   ]
+  },
+  {
+   "base": "RAAF Base Pearce",
+   "file": "raaf-base-pearce.geojson",
+   "bbox": [
+    115.9968,
+    -31.71451,
+    116.03466,
+    -31.63471
+   ],
+   "bands": [
+    "20-25",
+    "25-30",
+    "30-35",
+    "35-40",
+    "40+"
+   ]
+  },
+  {
+   "base": "RAAF Base Point Cook",
+   "file": "raaf-base-point-cook.geojson",
+   "bbox": [
+    144.71967,
+    -37.96849,
+    144.79484,
+    -37.88602
+   ],
+   "bands": [
+    "15-20",
+    "20-25",
+    "25-30",
+    "30-35",
+    "35-40",
+    "35-40",
+    "35-40",
+    "35-40"
+   ]
+  },
+  {
+   "base": "RAAF Base Richmond",
+   "file": "raaf-base-richmond.geojson",
+   "bbox": [
+    150.70549,
+    -33.64158,
+    150.84298,
+    -33.57547
+   ],
+   "bands": [
+    "20-25",
+    "25-30",
+    "30-35",
+    "35+"
+   ]
+  },
+  {
+   "base": "RAAF Base Scherger",
+   "file": "raaf-base-scherger.geojson",
+   "bbox": [
+    142.01004,
+    -12.6742,
+    142.16606,
+    -12.57163
+   ],
+   "bands": [
+    "20-25",
+    "25-30",
+    "30-35",
+    "35-40",
+    "40+"
+   ]
+  },
+  {
+   "base": "RAAF Base Tindal",
+   "file": "raaf-base-tindal.geojson",
+   "bbox": [
+    132.28451,
+    -14.60355,
+    132.45571,
+    -14.41716
+   ],
+   "bands": [
+    "20-25",
+    "25-30",
+    "30-35",
+    "35-40",
+    "40+"
+   ]
+  },
+  {
+   "base": "RAAF Base Townsville",
+   "file": "raaf-base-townsville.geojson",
+   "bbox": [
+    146.72647,
+    -19.32006,
+    146.83687,
+    -19.11897
+   ],
+   "bands": [
+    "20-25",
+    "20-25",
+    "20-25",
+    "25-30",
+    "30-35",
+    "35-40",
+    "40+",
+    "40+",
+    "40+",
+    "40+",
+    "40+"
+   ]
+  },
+  {
+   "base": "RAAF Base Williamtown",
+   "file": "raaf-base-williamtown.geojson",
+   "bbox": [
+    151.73796,
+    -32.86908,
+    151.95323,
+    -32.64029
+   ],
+   "bands": [
+    "20-25",
+    "20-25",
+    "20-25",
+    "25-30",
+    "25-30",
+    "25+",
+    "25+",
+    "25+",
+    "30-35",
+    "30-35",
+    "35-40",
+    "35-40",
+    "40+",
+    "40+"
+   ]
+  }
+ ]
+}
