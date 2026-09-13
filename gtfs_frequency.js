@@ -195,6 +195,13 @@ const DAY_FROM = 7, DAY_TO = 19, PEAK_FROM = 7, PEAK_TO = 9;
 const DEST_SHARE = 0.05;   // drop a headsign below 5% of a stop's weekday trips (depot runs, short workings)
 const DEST_MAX = 8;        // cap the stored destination list
 
+// A candidate reference day must carry at least this share of the BEST candidate's TRIP COUNT to
+// count as a real day. See the long note in pickReferenceDays: below this, an operator's calendar
+// has simply ended and the day is a coverage cliff, not a quiet Wednesday.
+// 0.8 is deliberately generous. Genuine week-to-week variation in a normal feed is a few percent;
+// the NSW cliff that prompted this was roughly 97% of Sydney Trains vanishing at once.
+const COVERAGE_FLOOR = 0.8;
+
 // ---- csv helper ---------------------------------------------------------
 // Header-driven, never positional: GTFS column order is not fixed between feeds or versions.
 function headerIndex(line, wanted) {
@@ -410,32 +417,66 @@ async function parseFeed(zip, fixedMode, acc, refDays) {
  * has the most special events layered on, and the min is a holiday. The median is the ordinary
  * week a renter would actually experience.
  */
-function pickReferenceDays(zip) {
+async function pickReferenceDays(zips) {
+  // 🔴 EVERY FEED, NOT THE LARGEST ONE. Victoria ships a zip-of-zips, one GTFS feed per mode, and
+  // this used to read reference days from whichever inner zip was biggest. That made the choice
+  // blind to the other modes' calendars: if the tram feed's calendar ended before the bus feed's,
+  // the chosen day silently dropped every tram. Measured 13 Sep 2026 when this was fixed: VIC went
+  // from 24,720 to 27,813 stops, so roughly 3,000 Victorian stops were being lost this way.
+  // ⚠️ Reference days must still be ONE set shared by all feeds. Picking per-feed would compare a
+  // school-term bus day against a holiday train day at the same interchange.
+  const list = Array.isArray(zips) ? zips : [zips];
+
+  // ⚠️ service_ids COLLIDE ACROSS INNER FEEDS - each one numbers its own from 1 - so every id is
+  // namespaced by feed index. Without this, one feed's "T2" silently answers for another's.
   const cal = [];
-  let ci = null;
-  const lines = zip.read('calendar.txt').toString('utf8').split(/\r?\n/);
-  for (const line of lines) {
-    if (ci === null) { ci = headerIndex(line, ['service_id', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday', 'start_date', 'end_date']); continue; }
-    if (!line.trim()) continue;
-    const c = csvSplit(line);
-    cal.push({
-      id: c[ci.service_id], start: c[ci.start_date], end: c[ci.end_date],
-      monday: c[ci.monday], tuesday: c[ci.tuesday], wednesday: c[ci.wednesday],
-      thursday: c[ci.thursday], friday: c[ci.friday], saturday: c[ci.saturday], sunday: c[ci.sunday],
-    });
-  }
   const calDates = new Map();
-  let di = null;
-  if (zip.has('calendar_dates.txt')) {
-    for (const line of zip.read('calendar_dates.txt').toString('utf8').split(/\r?\n/)) {
-      if (di === null) { di = headerIndex(line, ['service_id', 'date', 'exception_type']); continue; }
+  const tripsPerService = new Map();
+
+  for (let z = 0; z < list.length; z++) {
+    const zip = list[z];
+    const ns = (id) => z + '\u0000' + id;
+
+    let ci = null;
+    for (const line of zip.read('calendar.txt').toString('utf8').split(/\r?\n/)) {
+      if (ci === null) { ci = headerIndex(line, ['service_id', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday', 'start_date', 'end_date']); continue; }
       if (!line.trim()) continue;
       const c = csvSplit(line);
-      const d = c[di.date];
-      if (!calDates.has(d)) calDates.set(d, []);
-      calDates.get(d).push([c[di.service_id], c[di.exception_type]]);
+      cal.push({
+        id: ns(c[ci.service_id]), start: c[ci.start_date], end: c[ci.end_date],
+        monday: c[ci.monday], tuesday: c[ci.tuesday], wednesday: c[ci.wednesday],
+        thursday: c[ci.thursday], friday: c[ci.friday], saturday: c[ci.saturday], sunday: c[ci.sunday],
+      });
     }
+
+    let di = null;
+    if (zip.has('calendar_dates.txt')) {
+      for (const line of zip.read('calendar_dates.txt').toString('utf8').split(/\r?\n/)) {
+        if (di === null) { di = headerIndex(line, ['service_id', 'date', 'exception_type']); continue; }
+        if (!line.trim()) continue;
+        const c = csvSplit(line);
+        const d = c[di.date];
+        if (!calDates.has(d)) calDates.set(d, []);
+        calDates.get(d).push([ns(c[di.service_id]), c[di.exception_type]]);
+      }
+    }
+
+    // 🔴 WEIGHT A DAY BY ITS TRIPS, NOT BY ITS service_id COUNT.
+    // The count of active service_ids is an arbitrary number: one operator may use a single id for
+    // every weekday and another fifty for the same service. It is therefore nearly blind to the
+    // failure this exists to catch. When Sydney Trains dropped out of the NSW feed past its
+    // calendar horizon, the service_id count barely moved while roughly 97% of the actual trains
+    // vanished. Trips are the real quantity of service, and comparable across feeds and operators.
+    let tpi = null;
+    await zip.streamLines('trips.txt', (line) => {
+      if (tpi === null) { tpi = headerIndex(line, ['service_id']); return; }
+      if (!line.trim()) return;
+      const sid = csvSplit(line)[tpi.service_id];
+      if (sid) tripsPerService.set(ns(sid), (tripsPerService.get(ns(sid)) || 0) + 1);
+    });
   }
+
+  const dayWeight = (ids) => { let t = 0; for (const id of ids) t += tripsPerService.get(id) || 0; return t; };
 
   const starts = cal.map((c) => c.start).filter(Boolean).sort();
   const ends = cal.map((c) => c.end).filter(Boolean).sort();
@@ -450,12 +491,48 @@ function pickReferenceDays(zip) {
     while (cur.getUTCDay() !== targetDow) cur.setUTCDate(cur.getUTCDate() + 1);
     while (cur <= to && cands.length < 10) {
       const key = fmt(cur);
-      cands.push({ key, n: servicesOn(cal, calDates, key).size });
+      cands.push({ key, n: dayWeight(servicesOn(cal, calDates, key)) });
       cur.setUTCDate(cur.getUTCDate() + 7);
     }
     const live = cands.filter((c) => c.n > 0).sort((a, b) => a.n - b.n);
     if (!live.length) throw new Error('no active ' + label + ' found in feed window');
-    best[label] = live[Math.floor(live.length / 2)].key;   // median, not max
+
+    // 🔴 COVERAGE FLOOR. Discard candidate days whose active-service count is far below the best
+    // available, BEFORE taking the median. Those days are not quiet, they are days the feed does not
+    // really cover, and the plain median walks straight into them.
+    //
+    // FOUND LIVE 13 Sep 2026 ON THE FIRST NSW BUILD, and it was serious. A combined state feed holds
+    // several operators with DIFFERENT publishing horizons: Sydney Metro and regional TrainLink
+    // publish months ahead, Sydney Trains a few weeks. The median Wednesday landed on 28 October,
+    // roughly six weeks out, PAST THE END OF SYDNEY TRAINS' CALENDAR. Result:
+    //
+    //   Parramatta Station    3 daytime departures   (hundreds in reality)
+    //   Strathfield Station   7
+    //   Hornsby Station       6
+    //   Town Hall / Wynyard / Circular Quay   NO ROW AT ALL
+    //
+    // Every station that still looked healthy was METRO. The whole suburban network had silently
+    // dropped out, and the row would have told a Parramatta renter there are three trains a day.
+    // ⚠️ It UNDERSTATES rather than overstating, so it is not false reassurance, but it is flatly
+    // wrong and reads as authoritative.
+    //
+    // The original "median, not max" reasoning still holds and is kept: the max is whichever week
+    // has the most special events layered on, and the min is a public holiday. The floor only
+    // removes the days that are not really in the feed at all.
+    const peak = live[live.length - 1].n;
+    const covered = live.filter((c) => c.n >= peak * COVERAGE_FLOOR);
+    best[label] = covered[Math.floor(covered.length / 2)].key;   // median OF THE COVERED DAYS
+
+    // ⚠️ Say it out loud when candidates were dropped. A silent correction here would hide the
+    // very condition that made this necessary, and the next feed to do it might drop something we
+    // have no station names to notice.
+    if (covered.length < live.length) {
+      const lost = live.length - covered.length;
+      console.log(`  ⚠ ${label}: ignored ${lost} of ${live.length} candidate day(s) carrying under `
+        + `${Math.round(COVERAGE_FLOOR * 100)}% of the peak ${peak.toLocaleString()} trips - an `
+        + `operator's calendar ends before them. Chose ${best[label]} `
+        + `(${covered[Math.floor(covered.length / 2)].n.toLocaleString()} trips).`);
+    }
   }
   return best;
 }
@@ -502,11 +579,9 @@ if (require.main !== module) return;   // importing must not run the ingest
     // VIC: a zip of per-mode GTFS zips. The mode is the folder number.
     const inners = outer.names().filter((n) => n.endsWith('.zip'));
     if (!inners.length) throw new Error('feed is marked nested but contains no inner zips');
-    // Reference days come from the largest inner feed, then are applied to ALL of them, so every
-    // mode is counted on the same calendar day. Picking per-feed would compare a school-term bus
-    // day against a holiday train day at the same interchange.
-    const probe = readZip(outer.read(inners.slice().sort((a, b) => outer.read(b).length - outer.read(a).length)[0]));
-    ref = pickReferenceDays(probe);
+    // ONE set of reference days, chosen across ALL inner feeds together. See the note in
+    // pickReferenceDays: reading only the largest feed cost Victoria about 3,000 stops.
+    ref = await pickReferenceDays(inners.map((i) => readZip(outer.read(i))));
     console.log(`reference days: Wed ${ref.wed} · Sat ${ref.sat} · Sun ${ref.sun}`);
     const refDays = [ref.wed, ref.sat, ref.sun];
     for (const inner of inners.sort()) {
@@ -518,7 +593,7 @@ if (require.main !== module) return;   // importing must not run the ingest
     }
   } else {
     // NSW / SA: one combined feed. Mode comes from each route's route_type.
-    ref = pickReferenceDays(outer);
+    ref = await pickReferenceDays(outer);
     console.log(`reference days: Wed ${ref.wed} · Sat ${ref.sat} · Sun ${ref.sun}`);
     process.stdout.write('  single combined feed (mode from route_type) … ');
     await parseFeed(outer, null, acc, [ref.wed, ref.sat, ref.sun]);
