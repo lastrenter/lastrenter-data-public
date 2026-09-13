@@ -1,0 +1,100 @@
+# Build the public-transport frequency TILES and commit them to the data repo.
+#
+# 🔴 THIS WORKFLOW LIVES IN THE **PUBLIC** DATA REPO (lastrenter/lastrenter-data-public), NOT in the
+# private adapter repo like every other workflow here. That is deliberate and it is the whole point:
+# a workflow can commit to its OWN repo with the built-in GITHUB_TOKEN, so no personal access token
+# and no cross-repo credential is needed. Putting it in the private repo would require a PAT with
+# write access to the public one, which is a secret we would then have to manage forever.
+#
+# WHY IT EXISTS: the tiles are ~765 small JSON files. Uploading those by hand through the GitHub web
+# UI is not realistic, and the web UI FLATTENS folders, which is how a file called index.json nearly
+# overwrote the live Defence ANEF index at the repo root. This removes the manual step entirely and
+# makes the dataset self-updating, exactly like the crime adapters.
+#
+# ⚠️ Files to put in lastrenter-data-public ONCE (three of them), then never again:
+#     gtfs_frequency.js        (repo ROOT, flat)
+#     zip.js                   (repo ROOT, flat)
+#     .github/workflows/gtfs_tiles_ingest.yml   (this file)
+#
+# ⚠️ NSW NEEDS A SECRET. Add TFNSW_KEY under Settings > Secrets and variables > Actions. Repository
+# secrets are NOT public even in a public repo. Without it the NSW feed is SKIPPED with a clear
+# message rather than failing the run, so VIC and SA still publish.
+
+name: GTFS transit-frequency tiles
+
+on:
+  schedule:
+    # Monthly, on the 2nd. The crime crons run on the 1st; staggering keeps two heavy jobs apart
+    # and means a failure is easy to attribute to one pipeline or the other.
+    - cron: '0 17 2 * *'
+  workflow_dispatch:
+    inputs:
+      feed:
+        description: 'Which feed to build'
+        required: false
+        default: 'all'
+        type: choice
+        options: [all, vic, sa, nsw]
+
+permissions:
+  contents: write        # needed to commit the tiles back
+
+concurrency:
+  group: gtfs-tiles
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Build tiles
+        env:
+          # 🔐 Read from the repo secret. Never echoed: the builder reads it from the environment,
+          # sends it as an Authorization header, and never logs or caches it.
+          TFNSW_KEY: ${{ secrets.TFNSW_KEY }}
+          FEED_INPUT: ${{ github.event.inputs.feed || 'all' }}
+        run: |
+          set -euo pipefail
+          FEEDS="$FEED_INPUT"
+          if [ "$FEEDS" = "all" ]; then FEEDS="vic sa nsw"; fi
+          for f in $FEEDS; do
+            if [ "$f" = "nsw" ] && [ -z "${TFNSW_KEY:-}" ]; then
+              echo "::warning::skipping nsw - the TFNSW_KEY repository secret is not set"
+              continue
+            fi
+            echo "::group::$f"
+            # ⚠️ VIC is a 275 MB zip-of-zips whose stop_times.txt inflates to several GB. It is
+            # streamed line by line, never buffered, but the aggregation still wants headroom.
+            node --max-old-space-size=8192 gtfs_frequency.js --feed "$f" --out .
+            echo "::endgroup::"
+          done
+
+      - name: Show what changed
+        run: |
+          git add -A -- '*-transit-*.json'
+          git status --short -- '*-transit-*.json' | head -20
+          echo "total transit files: $(ls -1 *-transit-*.json 2>/dev/null | wc -l)"
+
+      - name: Commit
+        run: |
+          set -euo pipefail
+          # ⚠️ Scoped to the transit files ONLY. The repo root also holds the ANEF index.json, the
+          # ANEF geojsons, nsw-bond-outcomes.json, sa-canopy.json, qld-heritage.json and nt-flood.json,
+          # none of which this job has any business touching. A bare `git add -A` would sweep them in.
+          git add -- '*-transit-*.json'
+          if git diff --cached --quiet; then
+            echo "no change - the upstream feeds have not moved since the last run"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "GTFS transit-frequency tiles: $(date -u +%Y-%m-%d)"
+          git push
