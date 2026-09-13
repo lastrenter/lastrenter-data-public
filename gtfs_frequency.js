@@ -118,7 +118,7 @@ const FEEDS = {
     bbox: { minLat: -39.3, maxLat: -33.9, minLon: 140.9, maxLon: 150.1 },
     // 🔴 See SANITY note below. Floors are DELIBERATELY far under the true value.
     sanity: [
-      { match: 'Flinders Street', mode: 'train', min: 500 },
+      { match: 'Flinders Street', mode: 'train', min: 500, satMin: 200 },
       { match: 'Southern Cross', mode: 'train', min: 300 },
       { match: 'Swanston St', mode: 'tram', min: 100 },
       { match: 'Geelong', mode: 'train', min: 20 },
@@ -146,9 +146,9 @@ const FEEDS = {
     // twice before this existed. Floors are DELIBERATELY far under the true value.
     sanity: [
       { match: 'Parramatta Station', mode: 'train', min: 100 },
-      { match: 'Town Hall Station', mode: 'train', min: 200 },
+      { match: 'Town Hall Station', mode: 'train', min: 200, satMin: 100 },
       { match: 'Strathfield Station', mode: 'train', min: 100 },
-      { match: 'Circular Quay', mode: 'ferry', min: 100 },
+      { match: 'Circular Quay', mode: 'ferry', min: 100, satMin: 100 },
     ],
   },
   sa: {
@@ -164,7 +164,7 @@ const FEEDS = {
     nested: false,
     bbox: { minLat: -38.1, maxLat: -25.9, minLon: 128.9, maxLon: 141.1 },
     sanity: [
-      { match: 'Adelaide Railway Station', mode: 'train', min: 200 },
+      { match: 'Adelaide Railway Station', mode: 'train', min: 200, satMin: 100 },
       { match: 'Glenelg', mode: 'tram', min: 50 },
     ],
   },
@@ -412,13 +412,16 @@ async function parseFeed(zip, fixedMode, acc, refDays) {
     // too. Only 105 of 24,717 VIC places are multi-mode, but they are the major interchanges.
     const ckey = sid + '\u0000' + info.mode;
     let e = acc.counts.get(ckey);
-    if (!e) { e = { sid, mode: info.mode, hours: new Int32Array(30), sat: 0, sun: 0, routes: new Set(), heads: new Map() }; acc.counts.set(ckey, e); }
-    if (info.mask & 1) e.hours[Math.min(hh, 29)]++;   // reference weekday
+    if (!e) { e = { sid, mode: info.mode, hours: new Int32Array(30), sat: [0, 0, 0], sun: [0, 0, 0], routes: new Set(), heads: new Map() }; acc.counts.set(ckey, e); }
+    if (info.mask & 1) e.hours[Math.min(hh, 29)]++;   // reference weekday (bit 0)
     // ⚠️ Weekend counts are scoped to the daytime window so they are directly comparable with
     // deps_daytime on the same page line. See the DAY_FROM comment above.
-    if (inDay && (info.mask & 2)) e.sat++;
-    if (inDay && (info.mask & 4)) e.sun++;
-    // 🔴 MODE, ROUTES AND DESTINATIONS COME FROM ANY REFERENCE DAY, NOT JUST THE WEEKDAY.
+    // Bits 1..3 are the three sample Saturdays, bits 4..6 the three Sundays.
+    if (inDay) {
+      for (let k = 0; k < 3; k++) if (info.mask & (1 << (1 + k))) e.sat[k]++;
+      for (let k = 0; k < 3; k++) if (info.mask & (1 << (4 + k))) e.sun[k]++;
+    }
+    // 🔴 MODE, ROUTES AND DESTINATIONS COME FROM ANY OF THE SEVEN REFERENCE DAYS, NOT JUST THE WEEKDAY.
     // Collecting them weekday-only left 2,954 Victorian stops with a service but NO route label,
     // every one of them weekend-only (rural Princes Hwy stops with one Saturday or Sunday coach).
     // The Python adapters never hit this because they DROP a stop whose weekday daytime count is
@@ -595,8 +598,37 @@ async function pickReferenceDays(zips) {
       console.log(`  ⚠ ${label}: NO candidate day covers every mode. Using the least-truncated one.`);
     }
     covered.sort((a, b) => a.n - b.n);
-    best[label] = covered[Math.floor(covered.length / 2)].key;   // median OF THE COVERED DAYS
-    const chosen = covered[Math.floor(covered.length / 2)];
+    const mid = Math.floor(covered.length / 2);
+    best[label] = covered[mid].key;                              // median OF THE COVERED DAYS
+
+    // 🔴 WEEKENDS GET THREE SAMPLE DAYS, NOT ONE, AND THE CLIENT SEES THE PER-STOP MEDIAN.
+    // Sydney runs TRACKWORK almost every weekend, on a different line each time. A single sampled
+    // Saturday is accurate for that date and wildly unrepresentative of the place. Measured on the
+    // first good NSW build, 13 Sep 2026:
+    //
+    //   Crows Nest Station    sat=0    sun=190     (Metro shut that Saturday)
+    //   Artarmon Station      sat=192  sun=0       (North Shore line shut that Sunday)
+    //   Wahroonga Station     sat=96   sun=0
+    //
+    // The page renders that as "no Saturday service", which a renter reads as a permanent fact
+    // about where they would live. It is a false statement produced by true data.
+    // ⚠️ The per-mode coverage floor CANNOT catch this: one line's trackwork is a few percent of
+    // statewide train trips, so the mode clears its floor comfortably.
+    // Three samples and a median means one closed weekend cannot set the number, while a stop with
+    // genuinely no weekend service still reports zero from three zeros.
+    // ⚠️ Rank EVERY live candidate by its WORST mode's coverage and take the best three DISTINCT
+    // days. Slicing around the median of `covered` was wrong: when the floor leaves only one
+    // qualifying day it padded with duplicates, so the median of three identical days is just the
+    // one day again and the whole defence evaporates silently. Measured on VIC, which produced
+    // "Sat 20260829/20260829/20260829".
+    // Ranking by worst-mode ratio also means that when EVERY weekend has trackwork somewhere, we
+    // sample the three least-affected ones, which is exactly what we want.
+    const worstRatio = (c) => (gated.length
+      ? Math.min(...gated.map((md) => (c.byMode[md] || 0) / (modePeak[md] || 1)))
+      : c.n);
+    best[label + '3'] = live.slice().sort((a, b) => worstRatio(b) - worstRatio(a)).slice(0, 3).map((c) => c.key);
+    while (best[label + '3'].length < 3) best[label + '3'].push(best[label]);   // feed with <3 candidates
+    const chosen = covered[mid];
     console.log(`  ${label} ${best[label]}: ` + gated.map((md) =>
       md + ' ' + (chosen.byMode[md] || 0).toLocaleString() + '/' + modePeak[md].toLocaleString()).join('  '));
 
@@ -657,8 +689,8 @@ if (require.main !== module) return;   // importing must not run the ingest
     // ONE set of reference days, chosen across ALL inner feeds together. See the note in
     // pickReferenceDays: reading only the largest feed cost Victoria about 3,000 stops.
     ref = await pickReferenceDays(inners.map((i) => readZip(outer.read(i))));
-    console.log(`reference days: Wed ${ref.wed} · Sat ${ref.sat} · Sun ${ref.sun}`);
-    const refDays = [ref.wed, ref.sat, ref.sun];
+    console.log(`reference days: Wed ${ref.wed} · Sat ${ref.sat3.join('/')} · Sun ${ref.sun3.join('/')} (weekend = per-stop median of 3)`);
+    const refDays = [ref.wed, ...ref.sat3, ...ref.sun3];   // 1 weekday + 3 Sat + 3 Sun
     for (const inner of inners.sort()) {
       const modeNum = inner.split('/')[0];
       const label = FEED.modes[modeNum] || 'other';
@@ -669,19 +701,19 @@ if (require.main !== module) return;   // importing must not run the ingest
   } else {
     // NSW / SA: one combined feed. Mode comes from each route's route_type.
     ref = await pickReferenceDays(outer);
-    console.log(`reference days: Wed ${ref.wed} · Sat ${ref.sat} · Sun ${ref.sun}`);
+    console.log(`reference days: Wed ${ref.wed} · Sat ${ref.sat3.join('/')} · Sun ${ref.sun3.join('/')} (weekend = per-stop median of 3)`);
     process.stdout.write('  single combined feed (mode from route_type) … ');
-    await parseFeed(outer, null, acc, [ref.wed, ref.sat, ref.sun]);
+    await parseFeed(outer, null, acc, [ref.wed, ...ref.sat3, ...ref.sun3]);
     console.log(`stops ${acc.stops.size.toLocaleString()}`);
   }
 
   // ── roll platforms up to their parent station ──────────────────────────
   // ⚠️ A metro station is many stop_ids (one per platform). Left alone, each platform shows a
   // fraction of the station's trains and the busiest station in Melbourne looks quiet.
-  const blank = (mode) => ({ mode, hours: new Int32Array(30), sat: 0, sun: 0, routes: new Set(), heads: new Map() });
+  const blank = (mode) => ({ mode, hours: new Int32Array(30), sat: [0, 0, 0], sun: [0, 0, 0], routes: new Set(), heads: new Map() });
   const mergeInto = (e, c) => {
     for (let h = 0; h < 30; h++) e.hours[h] += c.hours[h];
-    e.sat += c.sat; e.sun += c.sun;
+    for (let k = 0; k < 3; k++) { e.sat[k] += c.sat[k]; e.sun[k] += c.sun[k]; }
     for (const r of c.routes) e.routes.add(r);
     for (const [h, n] of c.heads) e.heads.set(h, (e.heads.get(h) || 0) + n);
   };
@@ -737,8 +769,12 @@ if (require.main !== module) return;   // importing must not run the ingest
   let emitted = 0;
   let outOfBounds = 0;
   for (const e of byPlace.values()) {
+    // ⚠️ MEDIAN of the three sampled days, so one trackwork weekend cannot set the number, and a
+    // stop with genuinely no weekend service still reports 0 from three zeros.
+    const med3 = (a) => a.slice().sort((x, y) => x - y)[1];
+    const satMed = med3(e.sat), sunMed = med3(e.sun);
     const wk = sum(e.hours, 0, 30);
-    if (!wk && !e.sat && !e.sun) continue;
+    if (!wk && !satMed && !sunMed) continue;
     const bb = FEED.bbox;
     if (bb && (e.lat < bb.minLat || e.lat > bb.maxLat || e.lon < bb.minLon || e.lon > bb.maxLon)) { outOfBounds++; continue; }
     const peak = sum(e.hours, PEAK_FROM, PEAK_TO);
@@ -746,7 +782,7 @@ if (require.main !== module) return;   // importing must not run the ingest
     emitted++;
     const labels = [...e.routes].sort(routeSort);
     const totalWd = [...e.heads.values()].reduce((a, b) => a + b, 0);
-    emittedRows.push({ name: e.name, mode: e.mode, day });
+    emittedRows.push({ name: e.name, mode: e.mode, day, sat: satMed });
     const key = `${Math.floor(e.lat / TILE)}_${Math.floor(e.lon / TILE)}`;
     if (!tiles.has(key)) tiles.set(key, []);
     tiles.get(key).push([
@@ -758,8 +794,8 @@ if (require.main !== module) return;   // importing must not run the ingest
       interval(peak, (PEAK_TO - PEAK_FROM) * 60),   // avg min between, or null if too few to average
       day,                             // raw count 7am-7pm
       interval(day, (DAY_TO - DAY_FROM) * 60),
-      e.sat,                           // Saturday departures, DAYTIME window
-      e.sun,                           // Sunday departures, DAYTIME window
+      satMed,                          // Saturday departures, DAYTIME window, median of 3 samples
+      sunMed,                          // Sunday departures, DAYTIME window, median of 3 samples
       e.mode,                          // ONE mode per row. See the (stop, mode) note above.
       // 🔴 ARRAYS, NOT COMMA-JOINED STRINGS, AND THIS IS A BUG FIX NOT A STYLE CHOICE.
       // Route and destination names genuinely contain commas: Victoria ships the single route
@@ -799,10 +835,23 @@ if (require.main !== module) return;   // importing must not run the ingest
     for (const chk of FEED.sanity) {
       const hits = emittedRows.filter((r) => r.mode === chk.mode && r.name.includes(chk.match));
       const best = hits.reduce((a, r) => Math.max(a, r.day), 0);
-      const okk = hits.length > 0 && best >= chk.min;
-      console.log(`  ${okk ? 'ok  ' : 'FAIL'}  ${chk.match} (${chk.mode}) ${best} daytime departures, floor ${chk.min}`
+      const bestSat = hits.reduce((a, r) => Math.max(a, r.sat), 0);
+      // ⚠️ THE WEEKEND FLOOR EXISTS BECAUSE OF THE TRACKWORK FAILURE. A single sampled Saturday made
+      // Crows Nest Station read "no Saturday service", which is a false statement about a place
+      // produced by true data about a date. A busy station reporting zero on a weekend is the
+      // signature of a closure being mistaken for a timetable.
+      let okk = hits.length > 0 && best >= chk.min;
+      if (okk && chk.satMin != null && bestSat < chk.satMin) okk = false;
+      console.log(`  ${okk ? 'ok  ' : 'FAIL'}  ${chk.match} (${chk.mode}) ${best} daytime`
+        + (chk.satMin != null ? `, ${bestSat} Saturday` : '') + ` departures, floor ${chk.min}`
+        + (chk.satMin != null ? `/${chk.satMin}` : '')
         + (hits.length ? '' : '   [NO MATCHING STOP AT ALL]'));
-      if (!okk) failures.push(`${chk.match} (${chk.mode}): ${hits.length ? best + ' departures, expected at least ' + chk.min : 'no such stop in the output'}`);
+      if (!okk) {
+        failures.push(`${chk.match} (${chk.mode}): `
+          + (hits.length ? `${best} weekday / ${bestSat} Saturday departures, expected at least `
+              + chk.min + (chk.satMin != null ? ' / ' + chk.satMin : '')
+            : 'no such stop in the output'));
+      }
     }
     if (failures.length) {
       throw new Error('SANITY FLOOR FAILED, nothing written. This almost always means the reference '
@@ -840,7 +889,7 @@ if (require.main !== module) return;   // importing must not run the ingest
     jurisdiction: FEED.jurisdiction,
     description: 'Public transport service frequency by stop and mode. One row per stop per mode, so an interchange carries separate tram and train figures. Departures on a typical weekday, Saturday and Sunday, plus average minutes between services, the routes serving the stop and where they go.',
     fields: ['lat', 'lon', 'name', 'weekday_departures', 'peak_departures', 'peak_avg_min', 'daytime_departures', 'daytime_avg_min', 'saturday_departures', 'sunday_departures', 'mode', 'routes', 'route_count', 'destinations'],
-    caveat: 'Average interval, not a guaranteed timetable: bunched services average the same as evenly spread ones. An avg_min field is null when fewer than 4 departures fall in the window - too few to average, so show the raw count instead. Counts are for one representative day of each type, chosen as the median of candidate days in the feed window. Saturday and Sunday counts use the SAME 7am to 7pm window as daytime_departures so the two are directly comparable. routes and destinations are ARRAYS because route names contain commas. Not a service guarantee.',
+    caveat: 'Average interval, not a guaranteed timetable: bunched services average the same as evenly spread ones. An avg_min field is null when fewer than 4 departures fall in the window - too few to average, so show the raw count instead. Counts are for one representative day of each type, chosen as the median of candidate days in the feed window. Saturday and Sunday counts use the SAME 7am to 7pm window as daytime_departures so the two are directly comparable, and are the MEDIAN of three sampled weekends so that a single trackwork closure does not set the number. routes and destinations are ARRAYS because route names contain commas. Not a service guarantee.',
     reference_days: ref,
     source: FEED.source,
     source_url: FEED.source_url,
