@@ -116,6 +116,13 @@ const FEEDS = {
     // would show an Adelaide renter one Sunday coach as if it were their transit service,
     // i.e. fabricated coverage in a state we do not cover. Clipped to the state bounds.
     bbox: { minLat: -39.3, maxLat: -33.9, minLon: 140.9, maxLon: 150.1 },
+    // 🔴 See SANITY note below. Floors are DELIBERATELY far under the true value.
+    sanity: [
+      { match: 'Flinders Street', mode: 'train', min: 500 },
+      { match: 'Southern Cross', mode: 'train', min: 300 },
+      { match: 'Swanston St', mode: 'tram', min: 100 },
+      { match: 'Geelong', mode: 'train', min: 20 },
+    ],
   },
   nsw: {
     name: 'New South Wales (TfNSW)',
@@ -135,6 +142,14 @@ const FEEDS = {
     // NSW's feed carries interstate coach termini the same way VIC's does (Canberra, Brisbane,
     // Melbourne). Same reasoning, same clip.
     bbox: { minLat: -37.6, maxLat: -28.1, minLon: 140.9, maxLon: 153.7 },
+    // 🔴 THESE ARE THE STATIONS THAT CAUGHT THE 13 Sep FAILURE. Parramatta shipped "3 departures"
+    // twice before this existed. Floors are DELIBERATELY far under the true value.
+    sanity: [
+      { match: 'Parramatta Station', mode: 'train', min: 100 },
+      { match: 'Town Hall Station', mode: 'train', min: 200 },
+      { match: 'Strathfield Station', mode: 'train', min: 100 },
+      { match: 'Circular Quay', mode: 'ferry', min: 100 },
+    ],
   },
   sa: {
     name: 'South Australia (Adelaide Metro)',
@@ -148,6 +163,10 @@ const FEEDS = {
     source_url: 'https://data.sa.gov.au/data/dataset/https-gtfs-adelaidemetro-com-au',
     nested: false,
     bbox: { minLat: -38.1, maxLat: -25.9, minLon: 128.9, maxLon: 141.1 },
+    sanity: [
+      { match: 'Adelaide Railway Station', mode: 'train', min: 200 },
+      { match: 'Glenelg', mode: 'tram', min: 50 },
+    ],
   },
   // ⛔ ACT is deliberately absent. Transport Canberra moved static GTFS behind the MyWay+ API in
   // June 2025 and it needs ACT_GTFS_ID / ACT_GTFS_SECRET from the MuleSoft portal, which we do
@@ -432,6 +451,7 @@ async function pickReferenceDays(zips) {
   const cal = [];
   const calDates = new Map();
   const tripsPerService = new Map();
+  const MODES_SEEN = new Set();
 
   for (let z = 0; z < list.length; z++) {
     const zip = list[z];
@@ -467,16 +487,45 @@ async function pickReferenceDays(zips) {
     // failure this exists to catch. When Sydney Trains dropped out of the NSW feed past its
     // calendar horizon, the service_id count barely moved while roughly 97% of the actual trains
     // vanished. Trips are the real quantity of service, and comparable across feeds and operators.
+    // route_id -> mode, so a trip can be attributed to train / tram / bus / ferry.
+    const rmode = new Map();
+    if (zip.has('routes.txt')) {
+      let rri = null;
+      await zip.streamLines('routes.txt', (line) => {
+        if (rri === null) { rri = headerIndex(line, ['route_id', 'route_type']); return; }
+        if (!line.trim()) return;
+        const c = csvSplit(line);
+        rmode.set(clean(c[rri.route_id]), modeForRouteType(parseInt(clean(c[rri.route_type]), 10)));
+      });
+    }
+
     let tpi = null;
     await zip.streamLines('trips.txt', (line) => {
-      if (tpi === null) { tpi = headerIndex(line, ['service_id']); return; }
+      if (tpi === null) { tpi = headerIndex(line, ['service_id', 'route_id']); return; }
       if (!line.trim()) return;
-      const sid = csvSplit(line)[tpi.service_id];
-      if (sid) tripsPerService.set(ns(sid), (tripsPerService.get(ns(sid)) || 0) + 1);
+      const c = csvSplit(line);
+      const sid = c[tpi.service_id];
+      if (!sid) return;
+      // ⚠️ For a nested feed the mode comes from the FOLDER, and routes.txt inside one mode's feed
+      // can still carry an odd route_type. Prefer the per-route answer, fall back to "other".
+      const md = rmode.get(clean(c[tpi.route_id])) || 'other';
+      const k = ns(sid) + '\u0001' + md;
+      tripsPerService.set(k, (tripsPerService.get(k) || 0) + 1);
+      MODES_SEEN.add(md);
     });
   }
 
-  const dayWeight = (ids) => { let t = 0; for (const id of ids) t += tripsPerService.get(id) || 0; return t; };
+  // Returns { total, byMode:{train,bus,...} } for a set of active service ids.
+  const dayWeight = (ids) => {
+    const byMode = {}; let total = 0;
+    for (const id of ids) {
+      for (const md of MODES_SEEN) {
+        const v = tripsPerService.get(id + '\u0001' + md);
+        if (v) { byMode[md] = (byMode[md] || 0) + v; total += v; }
+      }
+    }
+    return { total, byMode };
+  };
 
   const starts = cal.map((c) => c.start).filter(Boolean).sort();
   const ends = cal.map((c) => c.end).filter(Boolean).sort();
@@ -491,7 +540,8 @@ async function pickReferenceDays(zips) {
     while (cur.getUTCDay() !== targetDow) cur.setUTCDate(cur.getUTCDate() + 1);
     while (cur <= to && cands.length < 10) {
       const key = fmt(cur);
-      cands.push({ key, n: dayWeight(servicesOn(cal, calDates, key)) });
+      const w = dayWeight(servicesOn(cal, calDates, key));
+      cands.push({ key, n: w.total, byMode: w.byMode });
       cur.setUTCDate(cur.getUTCDate() + 7);
     }
     const live = cands.filter((c) => c.n > 0).sort((a, b) => a.n - b.n);
@@ -519,19 +569,44 @@ async function pickReferenceDays(zips) {
     // The original "median, not max" reasoning still holds and is kept: the max is whichever week
     // has the most special events layered on, and the min is a public holiday. The floor only
     // removes the days that are not really in the feed at all.
-    const peak = live[live.length - 1].n;
-    const covered = live.filter((c) => c.n >= peak * COVERAGE_FLOOR);
+    // 🔴 THE FLOOR MUST BE PER MODE. A whole-of-feed trip count CANNOT see one mode drop out when
+    // that mode is a minority of trips, and this is not hypothetical: measured 13 Sep 2026, a global
+    // 80% floor did NOT fix NSW. Sydney's trip count is dominated by BUSES, so losing the entire
+    // Sydney Trains network costs under 20% of total trips and sails over the threshold. Parramatta
+    // still shipped "3 departures". Trains are a fifth of the trips and most of the answer.
+    //
+    // So: every mode computes its OWN peak across the candidates, and a day must clear the floor on
+    // EVERY mode that matters. A day where the trains vanish now fails on the train dimension even
+    // though the buses are untouched.
+    const modePeak = {};
+    for (const md of MODES_SEEN) modePeak[md] = Math.max(0, ...live.map((c) => c.byMode[md] || 0));
+    const peakAll = Math.max(...Object.values(modePeak), 0);
+    // ⚠️ Ignore trivial modes: a handful of trips should not dictate the reference day. 1% of the
+    // biggest mode keeps NSW ferries (~2.5%) in scope while excluding stray one-off route types.
+    const gated = [...MODES_SEEN].filter((md) => modePeak[md] >= peakAll * 0.01 && modePeak[md] > 0);
+    const clears = (c) => gated.every((md) => (c.byMode[md] || 0) >= modePeak[md] * COVERAGE_FLOOR);
+
+    let covered = live.filter(clears);
+    if (!covered.length) {
+      // Never throw: a feed where no single day covers every mode still has to produce something.
+      // Fall back to the day with the best WORST mode, which is the least-truncated day available.
+      const score = (c) => Math.min(...gated.map((md) => (c.byMode[md] || 0) / (modePeak[md] || 1)));
+      covered = [live.slice().sort((a, b) => score(b) - score(a))[0]];
+      console.log(`  ⚠ ${label}: NO candidate day covers every mode. Using the least-truncated one.`);
+    }
+    covered.sort((a, b) => a.n - b.n);
     best[label] = covered[Math.floor(covered.length / 2)].key;   // median OF THE COVERED DAYS
+    const chosen = covered[Math.floor(covered.length / 2)];
+    console.log(`  ${label} ${best[label]}: ` + gated.map((md) =>
+      md + ' ' + (chosen.byMode[md] || 0).toLocaleString() + '/' + modePeak[md].toLocaleString()).join('  '));
 
     // ⚠️ Say it out loud when candidates were dropped. A silent correction here would hide the
     // very condition that made this necessary, and the next feed to do it might drop something we
     // have no station names to notice.
     if (covered.length < live.length) {
-      const lost = live.length - covered.length;
-      console.log(`  ⚠ ${label}: ignored ${lost} of ${live.length} candidate day(s) carrying under `
-        + `${Math.round(COVERAGE_FLOOR * 100)}% of the peak ${peak.toLocaleString()} trips - an `
-        + `operator's calendar ends before them. Chose ${best[label]} `
-        + `(${covered[Math.floor(covered.length / 2)].n.toLocaleString()} trips).`);
+      console.log(`  ⚠ ${label}: ignored ${live.length - covered.length} of ${live.length} candidate `
+        + `day(s) where at least one mode fell under ${Math.round(COVERAGE_FLOOR * 100)}% of its own `
+        + `peak - an operator's calendar ends before them.`);
     }
   }
   return best;
@@ -658,6 +733,7 @@ if (require.main !== module) return;   // importing must not run the ingest
   };
 
   const tiles = new Map();
+  const emittedRows = [];      // {name, mode, day} for the sanity floor below
   let emitted = 0;
   let outOfBounds = 0;
   for (const e of byPlace.values()) {
@@ -670,6 +746,7 @@ if (require.main !== module) return;   // importing must not run the ingest
     emitted++;
     const labels = [...e.routes].sort(routeSort);
     const totalWd = [...e.heads.values()].reduce((a, b) => a + b, 0);
+    emittedRows.push({ name: e.name, mode: e.mode, day });
     const key = `${Math.floor(e.lat / TILE)}_${Math.floor(e.lon / TILE)}`;
     if (!tiles.has(key)) tiles.set(key, []);
     tiles.get(key).push([
@@ -698,6 +775,42 @@ if (require.main !== module) return;   // importing must not run the ingest
   }
 
   if (outOfBounds) console.log(`dropped ${outOfBounds} stop(s) outside the ${FEED.name} bounding box (interstate coach termini)`);
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // 🔴 SANITY FLOOR. THROWS, so the GitHub Action FAILS and nothing is published.
+  //
+  // WHY THIS EXISTS: on 13 Sep 2026 the workflow ran green, committed 3,691 files, and the live
+  // client test passed 13/13 while Sydney Trains was entirely missing. Parramatta shipped
+  // "3 departures 7am-7pm". EVERY AUTOMATED CHECK PASSED because every check was about SHAPE:
+  // "a row was filled", "it credits Transport for NSW", "the field count matches the index".
+  // "3" is a perfectly well-formed integer in a perfectly well-formed row.
+  //
+  // A frequency number cannot be validated by its shape. The only check that works is one that
+  // knows roughly what the answer SHOULD be. So: a short list of places whose service level is not
+  // in doubt, with floors set FAR BELOW the true value, purely to catch a collapse.
+  //
+  // ⚠️ These are not accuracy assertions and must never be tightened into them. Timetables change,
+  // and a floor that tracks the real number closely would fail on an ordinary service revision.
+  // Parramatta runs hundreds of trains; the floor is 100. That gap is the point.
+  if (Array.isArray(FEED.sanity) && FEED.sanity.length) {
+    const failures = [];
+    console.log('');
+    console.log('sanity floor:');
+    for (const chk of FEED.sanity) {
+      const hits = emittedRows.filter((r) => r.mode === chk.mode && r.name.includes(chk.match));
+      const best = hits.reduce((a, r) => Math.max(a, r.day), 0);
+      const okk = hits.length > 0 && best >= chk.min;
+      console.log(`  ${okk ? 'ok  ' : 'FAIL'}  ${chk.match} (${chk.mode}) ${best} daytime departures, floor ${chk.min}`
+        + (hits.length ? '' : '   [NO MATCHING STOP AT ALL]'));
+      if (!okk) failures.push(`${chk.match} (${chk.mode}): ${hits.length ? best + ' departures, expected at least ' + chk.min : 'no such stop in the output'}`);
+    }
+    if (failures.length) {
+      throw new Error('SANITY FLOOR FAILED, nothing written. This almost always means the reference '
+        + 'day fell past an operator\'s calendar horizon and a whole network dropped out:\n  - '
+        + failures.join('\n  - ')
+        + '\nCheck the per-mode coverage lines printed above: a mode far below its own peak is the cause.');
+    }
+  }
 
   // One STAGING folder for all feeds, holding files named exactly as they must appear at the repo
   // ROOT. Uploading its CONTENTS (which is what the web UI does to a folder anyway) is then correct
